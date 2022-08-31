@@ -9,6 +9,12 @@ beforeAll(async () => {
     DROP TABLE IF EXISTS public.commits CASCADE;
     DROP TABLE IF EXISTS public.versions CASCADE;
     DROP TABLE IF EXISTS public.targets CASCADE;
+    DROP TABLE IF EXISTS public.schema_changes CASCADE;
+    DROP TYPE IF EXISTS public.commit_action CASCADE;
+    DROP TYPE IF EXISTS public.schema_change_criticality_level CASCADE;
+    
+    CREATE TYPE commit_action AS ENUM ('ADD', 'MODIFY', 'DELETE');
+    CREATE TYPE schema_change_criticality_level AS ENUM ('SAFE', 'DANGEROUS', 'BREAKING');
     
     CREATE TABLE public.targets (
       id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -24,7 +30,7 @@ beforeAll(async () => {
       service_url text,
       sdl text,
       commit text NOT NULL,
-      action text NOT NULL
+      action commit_action NOT NULL
     );
 
     CREATE TABLE public.versions (
@@ -40,12 +46,21 @@ beforeAll(async () => {
       commit_id uuid NOT NULL REFERENCES public.commits(id) ON DELETE CASCADE,
       PRIMARY KEY(version_id, commit_id)
     );
+
+    CREATE TABLE public.commit_changes (
+      id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+      commit_id uuid NOT NULL REFERENCES public.commits(id) ON DELETE CASCADE,
+      coordinate text NOT NULL,
+      code text NOT NULL,
+      criticality schema_change_criticality_level NOT NULL,
+      description text NOT NULL
+    );
   `);
 });
 
 beforeEach(async () => {
   await pool.query(sql`
-    TRUNCATE TABLE public.targets, public.commits, public.versions, public.version_commit;
+    TRUNCATE TABLE public.targets, public.commits, public.versions, public.version_commit, public.commit_changes;
   `);
 });
 
@@ -68,33 +83,30 @@ async function publish(input: {
   commit: string;
   action?: 'DELETE';
   composable: boolean;
+  changes: Array<{
+    code: string;
+    criticality: 'SAFE' | 'DANGEROUS' | 'BREAKING';
+    description: string;
+    coordinate: string;
+  }>;
 }) {
   await pool.transaction(async t => {
-    const previousVersion = await t.maybeOne<{
-      id: string;
+    const previousCommits = await t.query<{
+      commit_id: string;
+      version_id: string;
+      action: string;
+      service_name: string;
     }>(sql`
-      SELECT id FROM public.versions
-      WHERE target_id = ${input.target.id}
-      ORDER BY created_at DESC
-      LIMIT 1;
+        SELECT vc.commit_id, vc.version_id, c.action, c.service_name
+        FROM public.version_commit as vc 
+        INNER JOIN public.commits as c ON (c.id = vc.commit_id)
+        WHERE vc.version_id = (
+          SELECT id FROM public.versions
+          WHERE target_id = ${input.target.id}
+          ORDER BY created_at DESC
+          LIMIT 1
+        )
     `);
-
-    const previousCommits = previousVersion
-      ? await t.query<{
-          commit_id: string;
-          version_id: string;
-          action: string;
-          service_name: string;
-        }>(sql`
-      SELECT vc.commit_id, vc.version_id, c.action, c.service_name
-      FROM public.version_commit as vc 
-      INNER JOIN public.commits as c ON (c.id = vc.commit_id)
-      WHERE vc.version_id = ${previousVersion.id}
-    `)
-      : {
-          rowCount: 0,
-          rows: [],
-        };
 
     const serviceNameExists =
       previousCommits.rowCount > 0 && previousCommits.rows.some(r => r.service_name === input.serviceName);
@@ -135,6 +147,22 @@ async function publish(input: {
         sql`), (`
       )});
     `);
+
+    await t.query<{}>(sql`
+      INSERT INTO public.commit_changes (
+        commit_id,
+        coordinate,
+        code,
+        criticality,
+        description
+      ) VALUES (${sql.join(
+        input.changes.map(
+          change =>
+            sql`${commit.id}, ${change.coordinate}, ${change.code}, ${change.criticality}, ${change.description}`
+        ),
+        sql`), (`
+      )});
+    `);
   });
 }
 
@@ -150,6 +178,7 @@ test('add a subgraph', async () => {
     sdl: 'products-sdl',
     commit: '1',
     composable: false,
+    changes: [],
   });
 
   // publish reviews subgraph, turn into composable
@@ -161,6 +190,7 @@ test('add a subgraph', async () => {
     sdl: 'reviews-sdl',
     commit: '2',
     composable: true,
+    changes: [],
   });
 
   // latest version should be composable and point to the reviews subgraph (commit 2)
@@ -216,6 +246,7 @@ test('modify a subgraph', async () => {
     sdl: 'products-sdl',
     commit: '1',
     composable: false,
+    changes: [],
   });
 
   // publish reviews subgraph, turn into composable
@@ -227,6 +258,7 @@ test('modify a subgraph', async () => {
     sdl: 'reviews-sdl',
     commit: '2',
     composable: true,
+    changes: [],
   });
 
   // publish reviews subgraph again
@@ -238,6 +270,7 @@ test('modify a subgraph', async () => {
     sdl: 'reviews-modified-sdl',
     commit: '3',
     composable: true,
+    changes: [],
   });
 
   const latestVersion = await pool.one<{
@@ -292,6 +325,7 @@ test('delete a subgraph', async () => {
     sdl: 'products-sdl',
     commit: '1',
     composable: false,
+    changes: [],
   });
 
   // publish reviews subgraph, turn into composable
@@ -303,6 +337,7 @@ test('delete a subgraph', async () => {
     sdl: 'reviews-sdl',
     commit: '2',
     composable: true,
+    changes: [],
   });
 
   // remove the reviews subgraph
@@ -315,6 +350,7 @@ test('delete a subgraph', async () => {
     commit: '3',
     composable: true,
     action: 'DELETE',
+    changes: [],
   });
 
   const latestVersion = await pool.one<{
@@ -369,6 +405,7 @@ test('tell when subgraph was added', async () => {
     sdl: 'products-sdl',
     commit: '1',
     composable: false,
+    changes: [],
   });
 
   // publish reviews subgraph, turn into composable
@@ -380,6 +417,7 @@ test('tell when subgraph was added', async () => {
     sdl: 'reviews-sdl',
     commit: '2',
     composable: true,
+    changes: [],
   });
 
   // remove the reviews subgraph
@@ -391,6 +429,7 @@ test('tell when subgraph was added', async () => {
     sdl: 'reviews-modified-sdl',
     commit: '3',
     composable: true,
+    changes: [],
   });
 
   const added = await pool.one<{
@@ -419,6 +458,7 @@ test('tell when subgraph was most recently modified', async () => {
     sdl: 'products-sdl',
     commit: '1',
     composable: false,
+    changes: [],
   });
 
   // publish reviews subgraph, turn into composable
@@ -430,6 +470,7 @@ test('tell when subgraph was most recently modified', async () => {
     sdl: 'reviews-sdl',
     commit: '2',
     composable: true,
+    changes: [],
   });
 
   // remove the reviews subgraph
@@ -441,6 +482,7 @@ test('tell when subgraph was most recently modified', async () => {
     sdl: 'reviews-modified-sdl',
     commit: '3',
     composable: true,
+    changes: [],
   });
 
   const modified = await pool.one<{
@@ -469,6 +511,7 @@ test('tell when subgraph was deleted', async () => {
     sdl: 'products-sdl',
     commit: '1',
     composable: false,
+    changes: [],
   });
 
   // publish reviews subgraph, turn into composable
@@ -480,6 +523,7 @@ test('tell when subgraph was deleted', async () => {
     sdl: 'reviews-sdl',
     commit: '2',
     composable: true,
+    changes: [],
   });
 
   // remove the reviews subgraph
@@ -492,6 +536,7 @@ test('tell when subgraph was deleted', async () => {
     commit: '3',
     composable: true,
     action: 'DELETE',
+    changes: [],
   });
 
   // add the reviews subgraph again
@@ -503,6 +548,7 @@ test('tell when subgraph was deleted', async () => {
     sdl: 'reviews-added-again-sdl',
     commit: '4',
     composable: true,
+    changes: [],
   });
 
   const deleted = await pool.one<{
