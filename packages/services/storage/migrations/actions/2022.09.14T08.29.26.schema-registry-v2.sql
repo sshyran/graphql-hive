@@ -18,16 +18,16 @@ ALTER TABLE public.projects
 -- Set `projects.legacy_registry_model` to `FALSE` for all projects
 UPDATE public.projects SET legacy_registry_model = TRUE WHERE type = 'FEDERATION' OR type = 'STITCHING';
 
--- [ ] move `version_commit.url` to `commits.service_url`
 -- [ ] check if `commit.id` belongs to a single `version.id`
+-- [ ] move `version_commit.url` to `commits.service_url`
 -- UPDATE public.projects SET legacy_registry_model = TRUE WHERE type = 'FEDERATION' OR type = 'STITCHING';
 
 -- [ ] set `N/A` for single/custom projects
-UPDATE public.commits SET action = 'N/A' WHERE project_id IN (SELECT id WHERE WHERE type = 'SINGLE' OR type = 'CUSTOM');
+UPDATE public.commits SET action = 'N/A' WHERE project_id IN (SELECT id WHERE type = 'SINGLE' OR type = 'CUSTOM');
 
--- [ ] set `ADD` for stitching/federation projects
+-- [ ] set `ADD` for commits where `service_name` appears for the first time (stitching/federation projects)
 
--- [ ] set `MODIFY` for stitching/federation projects
+-- [ ] set `MODIFY` for commits where `service_name` does not appear for the first time (stitching/federation projects)
 
 
 ALTER TABLE public.version_commit
